@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DON'T LOOK AT IT</title>
+<style>
+/* basic stuff */
+:root{ box-sizing:border-box; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px); }
+html,body{height:100%;margin:0;background:#000;overflow:hidden;font-family:'Courier New',monospace;color:#c9c9c9;}
+#game{display:block;position:absolute;inset:0;width:100%;height:100%;}
+
+/* dark edges */
+#vignette{position:absolute;inset:0;pointer-events:none;background:radial-gradient(ellipse at center, transparent 30%, rgba(0,0,0,0.85) 95%);}
+
+.screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+background:rgba(0,0,0,0.92);text-align:center;padding:20px;padding-top:calc(20px + env(safe-area-inset-top,0px));}
+.screen h1{font-size:clamp(24px,6vw,48px);letter-spacing:4px;color:#a30000;text-shadow:0 0 20px #a30000;margin:0 0 16px;}
+.screen p{max-width:600px;line-height:1.6;font-size:clamp(12px,2.5vw,16px);color:#999;}
+.screen .hint{margin-top:26px;color:#e0e0e0;animation:pulse 1.6s infinite;}
+@keyframes pulse{0%,100%{opacity:.4}50%{opacity:1}}
+
+/* the bars at top */
+#hud{position:absolute;top:calc(10px + env(safe-area-inset-top,0px));left:10px;right:10px;display:flex;justify-content:space-between;
+font-size:12px;color:#ddd;pointer-events:none;text-shadow:0 0 4px #000;}
+.bar{width:120px;height:10px;border:1px solid #555;margin-top:3px;background:#111;}
+.fill{height:100%;background:#7a1e1e;transition:width .15s linear;}
+#key-indicator{position:absolute;top:calc(10px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%);
+font-size:13px;color:#888;pointer-events:none;}
+#key-indicator.got{color:#d4af37;}
+[hidden]{display:none!important;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="vignette"></div>
+<div id="hud">
+<div>BATTERY<div class="bar"><div class="fill" id="batFill" style="width:100%"></div></div></div>
+<div>SANITY<div class="bar"><div class="fill" id="sanFill" style="width:100%;background:#4a2a6a"></div></div></div>
+</div>
+<div id="key-indicator">KEY: not found</div>
+
+<div class="screen" id="startScreen">
+<h1>DON'T LOOK AT IT</h1>
+<p>Find the key. Reach the door. Something is in here with you.<br><br>
+WASD — move &nbsp; ARROWS — aim flashlight &nbsp; SHIFT — run (loud) &nbsp; F — flashlight on/off<br><br>
+If you shine your light on it too long, it gets angry. Glance, don't stare.</p>
+<div class="hint">PRESS ENTER TO BEGIN</div>
+</div>
+
+<div class="screen" id="endScreen" hidden>
+<h1 id="endTitle">YOU DIED</h1>
+<p id="endMsg"></p>
+<div class="hint">PRESS R TO TRY AGAIN</div>
+</div>
+
+<script>
+// get the canvas
+var cv = document.getElementById('game');
+var c = cv.getContext('2d');
+var fogCv = document.createElement('canvas');   // second canvas for the dark fog
+var fc = fogCv.getContext('2d');
+
+function resize(){
+  cv.width = innerWidth; cv.height = innerHeight;
+  fogCv.width = innerWidth; fogCv.height = innerHeight;
+}
+addEventListener('resize', resize);
+resize();
+
+// sizes
+var CELL = 34;
+var MW = 13, MH = 13;
+
+var keys = {};       // which keys are down
+var started = false;
+var ended = false;
+
+// keys we dont want the browser to use
+var stopKeys = ['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright','f','shift','enter','r','/',"'"];
+
+addEventListener('keydown', function(e){
+  var k = e.key.toLowerCase();
+  if(stopKeys.includes(k)) e.preventDefault();   // stops scrolling n stuff
+  keys[k] = true;
+  if(!started && e.key === 'Enter') startGame();
+  if(ended && k === 'r') startGame();
+}, {passive:false});
+
+addEventListener('keyup', function(e){
+  var k = e.key.toLowerCase();
+  if(stopKeys.includes(k)) e.preventDefault();
+  keys[k] = false;
+}, {passive:false});
+
+
+
+var actx = null;
+function initAudio(){
+  if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+// makes a beep
+function tone(freq, dur, type, vol, slideTo){
+  if(!actx) return;
+  if(!type) type = 'sine';
+  if(!vol) vol = 0.15;
+  var o = actx.createOscillator();
+  var g = actx.createGain();
+  o.type = type; o.frequency.value = freq;
+  if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, actx.currentTime + dur);
+  g.gain.value = vol;
+  g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+  o.connect(g); g.connect(actx.destination);
+  o.start(); o.stop(actx.currentTime + dur);
+}
+
+// static noise thing
+function noiseBurst(dur, vol){
+  if(!actx) return;
+  if(!dur) dur = 0.4;
+  if(!vol) vol = 0.3;
+  var buf = actx.createBuffer(1, actx.sampleRate*dur, actx.sampleRate);
+  var d = buf.getChannelData(0);
+  for(var i=0;i<d.length;i++) d[i] = (Math.random()*2-1) * (1 - i/d.length);
+  var src = actx.createBufferSource(); src.buffer = buf;
+  var g = actx.createGain(); g.gain.value = vol;
+  src.connect(g); g.connect(actx.destination); src.start();
+}
+
+// creepy background hum
+var drone = null;
+function startDrone(){
+  if(!actx || drone) return;
+  var o1 = actx.createOscillator(), o2 = actx.createOscillator(), g = actx.createGain();
+  o1.type = 'sine'; o1.frequency.value = 54;
+  o2.type = 'sine'; o2.frequency.value = 57;
+  g.gain.value = 0.035;
+  o1.connect(g); o2.connect(g); g.connect(actx.destination);
+  o1.start(); o2.start();
+  drone = {o1:o1, o2:o2, g:g};
+}
+
+// thump thump
+var hbTimer = 0;
+function heartbeat(dt, rate){
+  hbTimer += dt;
+  if(hbTimer > rate){
+    hbTimer = 0;
+    tone(58, 0.12, 'sine', 0.18, 45);
+    setTimeout(function(){ tone(50, 0.1, 'sine', 0.12, 40); }, 140);
+  }
+}
+
+
+// ------- MAZE -------
+var grid, gw, gh, openCells;
+
+// makes the maze (found this method online, it works)
+function genMaze(w, h){
+  gw = w*2+1; gh = h*2+1;
+  var g = Array.from({length:gh}, function(){ return Array(gw).fill(1); });   // 1 = wall
+  var vis = Array.from({length:h}, function(){ return Array(w).fill(false); });
+  var stack = [[0,0]];
+  vis[0][0] = true; g[1][1] = 0;
+  while(stack.length){
+    var cx = stack[stack.length-1][0];
+    var cy = stack[stack.length-1][1];
+    // which ways can we go
+    var dirs = [[0,-1],[0,1],[-1,0],[1,0]].filter(function(d){
+      var nx = cx+d[0], ny = cy+d[1];
+      return nx>=0 && ny>=0 && nx<w && ny<h && !vis[ny][nx];
+    });
+    if(!dirs.length){ stack.pop(); continue; }   // stuck so go back
+    var pick = dirs[Math.floor(Math.random()*dirs.length)];
+    var dx = pick[0], dy = pick[1];
+    var nx = cx+dx, ny = cy+dy;
+    vis[ny][nx] = true;
+    g[cy*2+1+dy][cx*2+1+dx] = 0;
+    g[ny*2+1][nx*2+1] = 0;
+    stack.push([nx,ny]);
+  }
+  return g;
+}
+
+// is there a wall here?
+function isWallAt(px, py){
+  var gx = Math.floor(px/CELL), gy = Math.floor(py/CELL);
+  if(gx<0 || gy<0 || gx>=gw || gy>=gh) return true;
+  return grid[gy][gx] === 1;
+}
+
+// line of sight, checks a bunch of points between 2 things
+function hasLOS(x1, y1, x2, y2){
+  var dist = Math.hypot(x2-x1, y2-y1);
+  var steps = Math.ceil(dist/6);
+  for(var i=1;i<steps;i++){
+    var t = i/steps;
+    if(isWallAt(x1+(x2-x1)*t, y1+(y2-y1)*t)) return false;
+  }
+  return true;
+}
+
+function cellCenter(cx, cy){
+  return {x: cx*CELL + CELL/2, y: cy*CELL + CELL/2};
+}
+
+
+// ------- GAME STUFF -------
+var p, mon, keyPos, doorPos, hasKey, sanity, battery, flashOn, flashLock, litTimer, glitch, shake, fake, endReason;
+var last = 0;
+var fLatch = false;   // so flashlight doesnt flicker when holding F
+
+function startGame(){
+  initAudio(); startDrone();
+  grid = genMaze(MW, MH);
+
+  // list all the empty cells
+  openCells = [];
+  for(var y=0;y<gh;y++){
+    for(var x=0;x<gw;x++){
+      if(grid[y][x] === 0) openCells.push({x:x, y:y});
+    }
+  }
+
+  var st = cellCenter(1,1);
+  p = {x:st.x, y:st.y, r:9, fx:1, fy:0, speed:110};
+
+  // sort so far cells are first
+  openCells.sort(function(a,b){
+    return Math.hypot(b.x-1, b.y-1) - Math.hypot(a.x-1, a.y-1);
+  });
+  var far = openCells.slice(0, Math.max(6, openCells.length*0.15|0));
+  doorPos = cellCenter(far[0].x, far[0].y);
+  keyPos = cellCenter(far[Math.floor(Math.random()*far.length)].x, far[Math.floor(Math.random()*far.length)].y);
+
+  // put monster somewhere in the middle
+  var ms = Math.floor(openCells.length*0.3);
+  var me = Math.floor(openCells.length*0.7);
+  var mCell = openCells[ms + Math.floor(Math.random()*(me-ms))];
+  var mc = cellCenter(mCell.x, mCell.y);
+  mon = {x:mc.x, y:mc.y, r:11, speed:44, state:'wander', target:{x:mc.x, y:mc.y}, wanderT:0, enrageT:0};
+
+  // reset everything
+  hasKey = false; sanity = 100; battery = 100; flashOn = false;
+  flashLock = 0; litTimer = 0; glitch = 0; shake = 0; fake = null;
+  endReason = null;
+
+  document.getElementById('key-indicator').className = '';
+  document.getElementById('key-indicator').textContent = 'KEY: not found';
+  document.getElementById('startScreen').hidden = true;
+  document.getElementById('endScreen').hidden = true;
+
+  started = true; ended = false;
+  last = performance.now();
+  requestAnimationFrame(loop);
+}
+
+function endGame(reason, title, msg){
+  ended = true; started = false; endReason = reason;
+  noiseBurst(0.5, 0.35);
+  tone(90, 0.6, 'sawtooth', 0.2, 30);
+  document.getElementById('endTitle').textContent = title;
+  document.getElementById('endMsg').textContent = msg;
+  document.getElementById('endScreen').hidden = false;
+}
+
+// checks all 4 corners so we dont walk into walls
+function canStandAt(cx, cy, r){
+  return !isWallAt(cx-r,cy-r) && !isWallAt(cx+r,cy-r) && !isWallAt(cx-r,cy+r) && !isWallAt(cx+r,cy+r);
+}
+
+// move x and y seperately so u can slide on walls
+function moveEntity(e, dx, dy){
+  var r = e.r*0.92;
+  if(dx){
+    var nx = e.x+dx;
+    if(canStandAt(nx, e.y, r)) e.x = nx;
+  }
+  if(dy){
+    var ny = e.y+dy;
+    if(canStandAt(e.x, ny, r)) e.y = ny;
+  }
+}
+
+// main loop
+function loop(now){
+  if(!started) return;
+  var dt = Math.min(0.05, (now-last)/1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function update(dt){
+  var running = keys['shift'];
+
+  // ---- player movement ----
+  var dx = 0, dy = 0;
+  if(keys['w']) dy -= 1;
+  if(keys['s']) dy += 1;
+  if(keys['a']) dx -= 1;
+  if(keys['d']) dx += 1;
+  var moving = dx || dy;
+  if(moving){
+    var len = Math.hypot(dx, dy);   // so diagonal isnt faster
+    var spd = p.speed * (running?1.7:1) * dt;
+    moveEntity(p, (dx/len)*spd, (dy/len)*spd);
+  }
+
+  // ---- aiming ----
+  var ax = 0, ay = 0;
+  if(keys['arrowup']) ay -= 1;
+  if(keys['arrowdown']) ay += 1;
+  if(keys['arrowleft']) ax -= 1;
+  if(keys['arrowright']) ax += 1;
+  if(ax || ay){
+    var alen = Math.hypot(ax, ay);
+    p.fx = ax/alen; p.fy = ay/alen;
+  }
+
+  // ---- flashlight ----
+  if(keys['f'] && flashLock <= 0){
+    if(!fLatch){ flashOn = !flashOn; fLatch = true; }
+  } else if(!keys['f']) fLatch = false;
+  if(flashLock > 0) flashLock -= dt;
+  if(flashOn){
+    battery = Math.max(0, battery - 5*dt);
+    if(battery <= 0){ flashOn = false; }
+  }
+  else battery = Math.min(100, battery + 6*dt);   // recharges when off
+
+  // ---- key and door ----
+  if(!hasKey && Math.hypot(p.x-keyPos.x, p.y-keyPos.y) < 28){
+    hasKey = true;
+    tone(500, 0.3, 'sine', 0.2, 900);
+    var ind = document.getElementById('key-indicator');
+    ind.textContent = 'KEY: found';
+    ind.className = 'got';
+  }
+  if(hasKey && Math.hypot(p.x-doorPos.x, p.y-doorPos.y) < 24){
+    endGame('win', 'YOU ESCAPED', 'You made it out. It watched you go.');
+    return;
+  }
+
+  // ---- sanity ----
+  var distToMon = Math.hypot(p.x-mon.x, p.y-mon.y);
+  var drain = 0.5 + (flashOn?0:0.5) + (distToMon<130 ? (130-distToMon)/70 : 0);   // worse in dark and near monster
+  sanity = Math.max(0, sanity - drain*dt);
+  if(sanity <= 0){
+    endGame('sanity', 'LOST TO THE DARK', 'Your mind gave out before your legs did.');
+    return;
+  }
+  heartbeat(dt, sanity<30 ? 0.5 : (distToMon<150 ? 0.6 : 1.1));
+
+  // fake monster when u go crazy lol
+  if(sanity < 40 && Math.random() < 0.003){
+    fake = {x:p.x+(Math.random()*2-1)*300, y:p.y+(Math.random()*2-1)*300, t:0.4};
+  }
+  if(fake){
+    fake.t -= dt;
+    if(fake.t <= 0) fake = null;
+  }
+
+  // ---- monster brain ----
+  var faceAng = Math.atan2(p.fy||0, p.fx||1);
+  var seen = hasLOS(mon.x, mon.y, p.x, p.y) && distToMon < 190;
+  var heard = running && distToMon < 110;
+  if(seen || heard){
+    mon.state = 'chase';
+    mon.target = {x:p.x, y:p.y};
+    mon.memT = 0.8;           // remembers you for a bit
+  }
+  else if(mon.memT > 0){
+    mon.memT -= dt;
+    mon.state = 'chase';
+  }
+  else {
+    // just walk around
+    mon.wanderT -= dt;
+    if(mon.state !== 'wander' || mon.wanderT <= 0){
+      mon.state = 'wander';
+      var rc = openCells[Math.floor(Math.random()*openCells.length)];
+      var cc = cellCenter(rc.x, rc.y);
+      mon.target = {x:cc.x, y:cc.y};
+      mon.wanderT = 3 + Math.random()*3;
+    }
+  }
+  mon.enrageT = Math.max(0, mon.enrageT - dt);
+  var mSpeed = mon.speed * (mon.state==='chase'?1.35:1) * (mon.enrageT>0?1.6:1) * dt;
+  var mdx = mon.target.x - mon.x;
+  var mdy = mon.target.y - mon.y;
+  var mlen = Math.hypot(mdx, mdy) || 1;
+  if(mlen > 4) moveEntity(mon, (mdx/mlen)*mSpeed, (mdy/mlen)*mSpeed);
+
+  // ---- dont look at it part ----
+  var angToMon = Math.atan2(mon.y-p.y, mon.x-p.x);
+  var diff = Math.abs(angToMon - faceAng);
+  if(diff > Math.PI) diff = 2*Math.PI - diff;
+  var lit = flashOn && distToMon < 260 && diff < 0.45 && hasLOS(p.x, p.y, mon.x, mon.y);
+  if(lit){ litTimer += dt; }
+  else litTimer = Math.max(0, litTimer - dt*1.5);
+
+  // looked too long -> it gets mad and jumps at you
+  if(litTimer > 2.6){
+    litTimer = 0;
+    mon.enrageT = 1.8;
+    var t = 0.25 + Math.random()*0.15;
+    mon.x = mon.x + (p.x-mon.x)*t;
+    mon.y = mon.y + (p.y-mon.y)*t;
+    mon.state = 'chase';
+    mon.memT = 2;
+    flashOn = false; flashLock = 1.4; glitch = 0.5; shake = 1;
+    noiseBurst(0.3, 0.25);
+    tone(140, 0.3, 'square', 0.15, 60);
+  }
+  glitch = Math.max(0, glitch - dt);
+  shake = Math.max(0, shake - dt*2);
+
+  // caught!!
+  if(distToMon < 18){
+    endGame('caught', 'YOU DIED', 'It finally caught up to you.');
+    return;
+  }
+
+  // update the bars
+  document.getElementById('batFill').style.width = battery + '%';
+  document.getElementById('sanFill').style.width = sanity + '%';
+}
+
+
+function draw(){
+  // clear screen
+  c.fillStyle = '#050505';
+  c.fillRect(0, 0, cv.width, cv.height);
+
+  var shX = (Math.random()*2-1)*shake*6;
+  var shY = (Math.random()*2-1)*shake*6;
+  c.save();
+  c.translate(cv.width/2 - p.x + shX, cv.height/2 - p.y + shY);   // camera follows player
+
+  // draw the maze
+  for(var y=0;y<gh;y++){
+    for(var x=0;x<gw;x++){
+      c.fillStyle = grid[y][x]===1 ? '#2c2c2c' : '#181818';
+      c.fillRect(x*CELL, y*CELL, CELL, CELL);
+      if(grid[y][x]===1){
+        c.strokeStyle = '#1f1f1f';
+        c.strokeRect(x*CELL, y*CELL, CELL, CELL);
+      }
+    }
+  }
+
+  // the key (glows)
+  if(!hasKey){
+    var gr = 18 + Math.sin(performance.now()/180)*4;
+    var kg = c.createRadialGradient(keyPos.x, keyPos.y, 0, keyPos.x, keyPos.y, gr);
+    kg.addColorStop(0, 'rgba(255,225,120,0.9)');
+    kg.addColorStop(1, 'rgba(255,225,120,0)');
+    c.fillStyle = kg;
+    c.beginPath(); c.arc(keyPos.x, keyPos.y, gr, 0, 7); c.fill();
+    c.fillStyle = '#ffe066';
+    c.beginPath(); c.arc(keyPos.x, keyPos.y, 7, 0, 7); c.fill();
+  }
+
+  // the door (green when u have key)
+  c.fillStyle = hasKey ? '#3a6b3a' : '#5a2a2a';
+  c.fillRect(doorPos.x-12, doorPos.y-12, 24, 24);
+
+  // monster (random colors when glitching)
+  c.fillStyle = glitch>0 ? 'hsl(' + Math.random()*360 + ',80%,50%)' : '#8a0000';
+  c.beginPath(); c.arc(mon.x, mon.y, mon.r, 0, 7); c.fill();
+  // eyes
+  c.fillStyle = '#fff';
+  c.beginPath();
+  c.arc(mon.x-3, mon.y-2, 1.6, 0, 7);
+  c.arc(mon.x+3, mon.y-2, 1.6, 0, 7);
+  c.fill();
+
+  // fake one
+  if(fake){
+    c.fillStyle = 'rgba(138,0,0,0.5)';
+    c.beginPath(); c.arc(fake.x, fake.y, 11, 0, 7); c.fill();
+  }
+
+  // player
+  c.fillStyle = '#cfcfcf';
+  c.beginPath(); c.arc(p.x, p.y, p.r, 0, 7); c.fill();
+
+  c.restore();
+
+  // ---- fog / darkness ----
+  // player is always in the middle of the screen so this is easy
+  var px = cv.width/2 + shX;
+  var py = cv.height/2 + shY;
+  fc.clearRect(0, 0, fogCv.width, fogCv.height);
+  fc.globalCompositeOperation = 'source-over';
+  fc.fillStyle = 'rgba(0,0,0,0.88)';
+  fc.fillRect(0, 0, fogCv.width, fogCv.height);   // cover everything in black
+  fc.globalCompositeOperation = 'destination-out';   // now cut holes in it
+
+  // small circle around player
+  var ag = fc.createRadialGradient(px, py, 0, px, py, 80);
+  ag.addColorStop(0, 'rgba(255,255,255,0.95)');
+  ag.addColorStop(1, 'rgba(255,255,255,0)');
+  fc.fillStyle = ag;
+  fc.beginPath(); fc.arc(px, py, 80, 0, 7); fc.fill();
+
+  // flashlight cone
+  if(flashOn){
+    var ang = Math.atan2(p.fy||0, p.fx||1);
+    var range = 320, half = 0.6;
+    var cg = fc.createRadialGradient(px, py, 0, px, py, range);
+    cg.addColorStop(0, 'rgba(255,255,255,0.95)');
+    cg.addColorStop(0.7, 'rgba(255,255,255,0.5)');
+    cg.addColorStop(1, 'rgba(255,255,255,0)');
+    fc.fillStyle = cg;
+    fc.beginPath();
+    fc.moveTo(px, py);
+    fc.arc(px, py, range, ang-half, ang+half);
+    fc.closePath(); fc.fill();
+  }
+  c.drawImage(fogCv, 0, 0);
+
+  // red flash when monster gets angry
+  if(glitch > 0){
+    c.fillStyle = 'rgba(255,0,0,' + (glitch*0.25) + ')';
+    c.fillRect(0, 0, cv.width, cv.height);
+  }
+}
+</script>
+</body>
+</html>
+
+
+
+
+  
